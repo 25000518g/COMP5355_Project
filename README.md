@@ -28,7 +28,7 @@ Secure Python messenger with TLS transport, CA-issued server certificates, and e
 4. When you register a new account, the client creates a local profile file named:
 	- `<username>_profile.json`
 
-	This profile stores the encrypted private key, local salt, trusted public key fingerprints, and replay-tracking data.
+	This profile stores the encrypted private key, client certificate PEM, local salt, trusted public key fingerprints, and replay-tracking data.
 
 ## Client menu guide
 
@@ -43,6 +43,7 @@ After launching the client, you will see these options:
 ### 2. Login
 - Authenticates the user with the server.
 - Unlocks the local encrypted private key using the user password.
+- Signs the login proof with the client private key; the server verifies it using the stored client certificate/public key.
 - Required before sending or receiving messages.
 
 ### 3. Logout

@@ -4,12 +4,15 @@ import secrets
 import socket
 import ssl
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography import x509
+from cryptography.x509.oid import NameOID
 
 HOST = '127.0.0.1'
 PORT = 5555
@@ -30,12 +33,48 @@ class SecureClient:
             'local_salt': None,
             'encrypted_private_key': None,
             'public_key_pem': None,
+            'certificate_pem': None,
             'server_ca_cert_pem': None,
             'server_certificate_pem': None,
             'trusted_public_keys': {},
             'trusted_public_key_fingerprints': {},
             'received_message_ids': [],
         }
+
+    def _build_client_certificate(self, private_key, username):
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, 'TW'),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'COMP5355 Project Users'),
+            x509.NameAttribute(NameOID.COMMON_NAME, username),
+        ])
+
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1))
+            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    key_encipherment=True,
+                    content_commitment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            .sign(private_key=private_key, algorithm=hashes.SHA256())
+        )
+
+        return certificate
 
     def _canonical_json(self, payload):
         return json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
@@ -163,11 +202,14 @@ class SecureClient:
         # 1. Generate identity cryptographic keys
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         public_key = private_key.public_key()
+        certificate = self._build_client_certificate(private_key, username)
         
         public_pem = public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ).decode('utf-8')
+
+        certificate_pem = certificate.public_bytes(serialization.Encoding.PEM).decode('utf-8')
 
         # 2. Hash the password with a fresh salt for the server verification
         pwd_hash, pwd_salt = self._hash_password(password)
@@ -177,7 +219,8 @@ class SecureClient:
             "username": username,
             "password_hash": pwd_hash,
             "password_salt": pwd_salt,
-            "public_key": public_pem
+            "public_key": public_pem,
+            "certificate": certificate_pem,
         }
         
         res = self.send_request(payload)
@@ -200,6 +243,7 @@ class SecureClient:
                 "local_salt": local_salt.hex(),
                 "encrypted_private_key": encrypted_private_pem.decode('utf-8'),
                 "public_key_pem": public_pem,
+                "certificate_pem": certificate_pem,
                 "server_ca_cert_pem": server_ca_cert_pem,
                 "server_certificate_pem": None,
                 "trusted_public_keys": {
@@ -228,33 +272,54 @@ class SecureClient:
         server_salt = salt_res["password_salt"]
         computed_hash, _ = self._hash_password(password, salt=server_salt)
 
-        # 3. Request Login Token verification
-        login_req = {
+        # 3. Unlock the local private key so we can sign the login proof
+        try:
+            profile = self._load_profile(username)
+
+            local_salt = bytes.fromhex(profile["local_salt"])
+            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=local_salt, iterations=100000)
+            decryption_key = kdf.derive(password.encode('utf-8'))
+
+            private_key = serialization.load_pem_private_key(
+                profile["encrypted_private_key"].encode('utf-8'),
+                password=decryption_key
+            )
+        except Exception:
+            return "Login Error: Could not unlock local cryptographic keys. Corrupted profile or bad local context."
+
+        # 4. Request Login Token verification
+        login_timestamp = int(time.time())
+        login_payload = {
             "action": "login",
             "username": username,
-            "password_hash": computed_hash
+            "password_hash": computed_hash,
+            "timestamp": login_timestamp,
+        }
+        login_signature = private_key.sign(
+            self._canonical_json(login_payload),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        login_req = {
+            **login_payload,
+            "signature": login_signature.hex(),
         }
         res = self.send_request(login_req)
         
         if res.get("status") == "success":
-            # 4. Authenticated with server! Now decrypt the local private key for E2EE messaging
+            # 5. Authenticated with server! Keep the unlocked private key for E2EE messaging
             try:
-                profile = self._load_profile(username)
-                
-                local_salt = bytes.fromhex(profile["local_salt"])
-                kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=local_salt, iterations=100000)
-                decryption_key = kdf.derive(password.encode('utf-8'))
-                
-                self.private_key = serialization.load_pem_private_key(
-                    profile["encrypted_private_key"].encode('utf-8'),
-                    password=decryption_key
-                )
+                self.private_key = private_key
                 self.public_key = self.private_key.public_key()
                 self.username = username
                 profile["public_key_pem"] = profile.get("public_key_pem") or self.public_key.public_bytes(
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PublicFormat.SubjectPublicKeyInfo
                 ).decode('utf-8')
+                profile["certificate_pem"] = profile.get("certificate_pem") or profile["public_key_pem"]
                 profile["server_ca_cert_pem"] = profile.get("server_ca_cert_pem") or (
                     CA_CERT_FILE.read_text(encoding='utf-8') if CA_CERT_FILE.exists() else None
                 )

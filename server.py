@@ -9,7 +9,7 @@ from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.x509.oid import NameOID
 
 HOST = '127.0.0.1'
@@ -43,6 +43,26 @@ def load_db():
 def save_db(data):
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
+
+
+def canonical_json(payload):
+    return json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+
+
+def _load_user_verification_key(user_record):
+    certificate_pem = user_record.get('certificate')
+    public_key_pem = user_record.get('public_key')
+
+    if certificate_pem:
+        try:
+            return x509.load_pem_x509_certificate(certificate_pem.encode('utf-8')).public_key()
+        except Exception:
+            pass
+
+    if public_key_pem:
+        return serialization.load_pem_public_key(public_key_pem.encode('utf-8'))
+
+    return None
 
 
 def _write_private_key(path, key):
@@ -190,11 +210,28 @@ def handle_client(raw_socket, tls_context):
                             if username in db['users']:
                                 response = {'status': 'error', 'message': 'Username already exists.'}
                             else:
+                                certificate_pem = request.get('certificate')
+                                public_key_pem = request.get('public_key')
+                                if certificate_pem:
+                                    try:
+                                        public_key_obj = x509.load_pem_x509_certificate(certificate_pem.encode('utf-8')).public_key()
+                                        public_key_pem = public_key_obj.public_bytes(
+                                            encoding=serialization.Encoding.PEM,
+                                            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                                        ).decode('utf-8')
+                                    except Exception:
+                                        response = {'status': 'error', 'message': 'Invalid client certificate.'}
+                                        _write_json_line(writer, response)
+                                        continue
+
                                 db['users'][username] = {
                                     'password_hash': request.get('password_hash'),
                                     'password_salt': request.get('password_salt'),
                                     'public_key': request.get('public_key'),
+                                    'certificate': certificate_pem,
                                 }
+                                if public_key_pem:
+                                    db['users'][username]['public_key'] = public_key_pem
                                 db['messages'].setdefault(username, [])
                                 save_db(db)
                                 response = {'status': 'success'}
@@ -212,15 +249,64 @@ def handle_client(raw_socket, tls_context):
                         elif action == 'login':
                             username = request.get('username')
                             pwd_hash = request.get('password_hash')
-                            if username in db['users'] and db['users'][username]['password_hash'] == pwd_hash:
-                                response = {'status': 'success'}
-                            else:
+                            signature_hex = request.get('signature')
+                            timestamp = request.get('timestamp')
+                            user_record = db['users'].get(username)
+
+                            if not user_record:
                                 response = {'status': 'error', 'message': 'Invalid username or password.'}
+                            elif not signature_hex or timestamp is None:
+                                response = {'status': 'error', 'message': 'Missing login proof.'}
+                            else:
+                                try:
+                                    login_timestamp = int(timestamp)
+                                except (TypeError, ValueError):
+                                    login_timestamp = None
+
+                                if login_timestamp is None or abs(int(datetime.now(timezone.utc).timestamp()) - login_timestamp) > 300:
+                                    response = {'status': 'error', 'message': 'Login proof expired.'}
+                                elif user_record.get('password_hash') != pwd_hash:
+                                    response = {'status': 'error', 'message': 'Invalid username or password.'}
+                                else:
+                                    verification_key = _load_user_verification_key(user_record)
+                                    if verification_key is None:
+                                        response = {'status': 'error', 'message': 'No client public certificate available.'}
+                                    else:
+                                        signed_payload = {
+                                            'action': 'login',
+                                            'username': username,
+                                            'password_hash': pwd_hash,
+                                            'timestamp': login_timestamp,
+                                        }
+                                        try:
+                                            verification_key.verify(
+                                                bytes.fromhex(signature_hex),
+                                                canonical_json(signed_payload),
+                                                padding.PSS(
+                                                    mgf=padding.MGF1(hashes.SHA256()),
+                                                    salt_length=padding.PSS.MAX_LENGTH,
+                                                ),
+                                                hashes.SHA256(),
+                                            )
+                                            response = {'status': 'success'}
+                                        except Exception:
+                                            response = {'status': 'error', 'message': 'Invalid login signature.'}
 
                         elif action == 'get_key':
                             target_user = request.get('target_user')
                             if target_user in db['users']:
-                                response = {'status': 'success', 'public_key': db['users'][target_user]['public_key']}
+                                user_record = db['users'][target_user]
+                                public_key = user_record.get('public_key')
+                                certificate_pem = user_record.get('certificate')
+                                if not public_key and certificate_pem:
+                                    try:
+                                        public_key = x509.load_pem_x509_certificate(certificate_pem.encode('utf-8')).public_key().public_bytes(
+                                            encoding=serialization.Encoding.PEM,
+                                            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                                        ).decode('utf-8')
+                                    except Exception:
+                                        public_key = None
+                                response = {'status': 'success', 'public_key': public_key}
                             else:
                                 response = {'status': 'error', 'message': 'User not found.'}
 
@@ -266,7 +352,7 @@ def main():
     server.bind((HOST, PORT))
     server.listen(5)
     print(f'[*] TLS server listening on {HOST}:{PORT}')
-    print(f'[*] CA certificate: {CA_CERT_FILE}')
+    print(f'[*] CA certificate: {CA_CERT_FILE}') 
 
     while True:
         client_sock, addr = server.accept()
